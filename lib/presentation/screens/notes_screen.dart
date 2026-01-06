@@ -19,15 +19,15 @@ class NotesScreen extends ConsumerStatefulWidget {
 class _NotesScreenState extends ConsumerState<NotesScreen> {
   final _searchController = TextEditingController();
   StreamSubscription<List<NoteModel>>? _notesSubscription;
-  List<NoteModel> _notes = [];
+  List<NoteModel> _allNotes = []; // Store all notes here
+  List<NoteModel> _filteredNotes = []; // Store filtered notes here
+  bool _isSearching = false;
+  Timer? _searchDebounce;
 
   @override
   void initState() {
     super.initState();
-    // Initialize the stream listener immediately
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _setupNotesListener();
-    });
+    _setupNotesListener();
   }
 
   @override
@@ -35,6 +35,7 @@ class _NotesScreenState extends ConsumerState<NotesScreen> {
     _notesSubscription?.cancel();
     _notesSubscription = null;
     _searchController.dispose();
+    _searchDebounce?.cancel();
     super.dispose();
   }
 
@@ -42,17 +43,19 @@ class _NotesScreenState extends ConsumerState<NotesScreen> {
     // Cancel any existing subscription
     _notesSubscription?.cancel();
 
-    // Get notes stream from Service (not ViewModel)
+    // Get notes stream from Service
     final notesStream = ref.read(notesServiceProvider).getNotesStream();
 
     // Listen to notes stream and update local state
     _notesSubscription = notesStream.listen(
       (notes) {
-        setState(() {
-          _notes = notes;
-        });
-        // Apply current search filter
-        _applySearchFilter(_searchController.text);
+        if (mounted) {
+          setState(() {
+            _allNotes = notes;
+            // Apply current search filter when new notes arrive
+            _applySearchFilter(_searchController.text);
+          });
+        }
       },
       onError: (error) {
         print('Notes stream error: $error');
@@ -61,14 +64,42 @@ class _NotesScreenState extends ConsumerState<NotesScreen> {
   }
 
   void _applySearchFilter(String query) {
+    // Cancel previous debounce timer
+    _searchDebounce?.cancel();
+
     if (query.isEmpty) {
-      ref.read(notesViewModelProvider.notifier).updateNotesList(_notes);
-    } else {
-      final filtered = _notes.where((note) {
-        return note.title.toLowerCase().contains(query.toLowerCase());
-      }).toList();
-      ref.read(notesViewModelProvider.notifier).updateNotesList(filtered);
+      setState(() {
+        _filteredNotes = List.from(_allNotes);
+        _isSearching = false;
+      });
+      return;
     }
+
+    // Debounce search to avoid rebuilding on every keystroke
+    _searchDebounce = Timer(const Duration(milliseconds: 300), () {
+      if (!mounted) return;
+
+      final lowerQuery = query.toLowerCase();
+      final filtered = _allNotes.where((note) {
+        return note.title.toLowerCase().contains(lowerQuery) ||
+            note.content.toLowerCase().contains(lowerQuery);
+      }).toList();
+
+      if (mounted) {
+        setState(() {
+          _filteredNotes = filtered;
+          _isSearching = true;
+        });
+      }
+    });
+  }
+
+  void _clearSearch() {
+    _searchController.clear();
+    setState(() {
+      _filteredNotes = List.from(_allNotes);
+      _isSearching = false;
+    });
   }
 
   void _showNoteDialog({NoteModel? note}) {
@@ -126,14 +157,14 @@ class _NotesScreenState extends ConsumerState<NotesScreen> {
                   try {
                     if (note == null) {
                       await ref
-                          .read(notesViewModelProvider.notifier)
+                          .read(notesServiceProvider)
                           .createNote(
                             title: titleController.text,
                             content: contentController.text,
                           );
                     } else {
                       await ref
-                          .read(notesViewModelProvider.notifier)
+                          .read(notesServiceProvider)
                           .updateNote(
                             id: note.id,
                             title: titleController.text,
@@ -183,11 +214,11 @@ class _NotesScreenState extends ConsumerState<NotesScreen> {
 
     if (confirmed == true) {
       try {
-        await ref.read(notesViewModelProvider.notifier).deleteNote(id);
+        await ref.read(notesServiceProvider).deleteNote(id);
 
         // Remove from local list immediately for better UX
         setState(() {
-          _notes = _notes.where((note) => note.id != id).toList();
+          _allNotes = _allNotes.where((note) => note.id != id).toList();
           _applySearchFilter(_searchController.text);
         });
 
@@ -210,7 +241,6 @@ class _NotesScreenState extends ConsumerState<NotesScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final notesState = ref.watch(notesViewModelProvider);
     final user = ref.watch(authViewModelProvider.select((state) => state.user));
     final authState = ref.watch(authViewModelProvider);
 
@@ -219,37 +249,64 @@ class _NotesScreenState extends ConsumerState<NotesScreen> {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
+    final displayNotes = _isSearching ? _filteredNotes : _allNotes;
+    final hasNotes = displayNotes.isNotEmpty;
+    final totalNotes = _allNotes.length;
+    final searchResultsCount = _filteredNotes.length;
+
     return Scaffold(
       appBar: AppBar(
-        title: Text('My Notes (${user?.email ?? 'User'})'),
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              'My Notes',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            if (_isSearching)
+              Text(
+                '$searchResultsCount result${searchResultsCount == 1 ? '' : 's'} found',
+                style: TextStyle(fontSize: 12, color: Colors.white70),
+              )
+            else
+              Text(
+                '$totalNotes note${totalNotes == 1 ? '' : 's'}',
+                style: TextStyle(fontSize: 12, color: Colors.white70),
+              ),
+          ],
+        ),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.logout),
-            onPressed: () async {
-              try {
-                // Clear the notes stream before logging out
-                _notesSubscription?.cancel();
-                _notesSubscription = null;
-                setState(() {
-                  _notes = [];
-                });
-
-                await ref.read(authViewModelProvider.notifier).signOut();
-
-                // Navigate to auth screen
-                Navigator.of(context).pushAndRemoveUntil(
-                  MaterialPageRoute(builder: (context) => const AuthScreen()),
-                  (route) => false,
-                );
-              } catch (e) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(
-                    content: Text('Error: ${e.toString()}'),
-                    backgroundColor: Colors.red,
-                  ),
-                );
+          // IconButton(
+          //   icon: Icon(_isSearching ? Icons.clear : Icons.search),
+          //   onPressed: () {
+          //     if (_isSearching) {
+          //       _clearSearch();
+          //     } else {
+          //       // Optionally focus on search
+          //       // You could add a search bar in app bar if needed
+          //     }
+          //   },
+          // ),
+          SizedBox.shrink(),
+          PopupMenuButton<String>(
+            onSelected: (value) {
+              if (value == 'logout') {
+                _showLogoutDialog();
               }
             },
+            itemBuilder: (context) => [
+              PopupMenuItem(
+                value: 'logout',
+                child: Row(
+                  children: [
+                    Icon(Icons.logout, color: Colors.red),
+                    SizedBox(width: 10),
+                    Text('Logout'),
+                  ],
+                ),
+              ),
+            ],
           ),
         ],
       ),
@@ -261,32 +318,67 @@ class _NotesScreenState extends ConsumerState<NotesScreen> {
               _applySearchFilter(query);
             },
             onClear: () {
-              _searchController.clear();
-              _applySearchFilter('');
+              _clearSearch();
             },
           ),
-          Expanded(
-            child: notesState.isLoading
-                ? const Center(child: CircularProgressIndicator())
-                : notesState.filteredNotes.isEmpty
-                ? const Center(
-                    child: Text(
-                      'No notes found',
-                      style: TextStyle(fontSize: 18, color: Colors.grey),
-                    ),
-                  )
-                : ListView.builder(
-                    itemCount: notesState.filteredNotes.length,
-                    itemBuilder: (context, index) {
-                      final note = notesState.filteredNotes[index];
-                      return NoteCard(
-                        note: note,
-                        onTap: () => _showNoteDialog(note: note),
-                        onDelete: () => _deleteNote(note.id),
-                      );
-                    },
+          if (_isSearching && _filteredNotes.isEmpty)
+            Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                children: [
+                  Icon(Icons.search_off, size: 60, color: Colors.grey.shade300),
+                  SizedBox(height: 16),
+                  Text(
+                    'No notes found',
+                    style: TextStyle(fontSize: 18, color: Colors.grey.shade600),
                   ),
-          ),
+                  Text(
+                    'Try different search terms',
+                    style: TextStyle(color: Colors.grey.shade400),
+                  ),
+                ],
+              ),
+            )
+          else
+            Expanded(
+              child: hasNotes
+                  ? ListView.builder(
+                      itemCount: displayNotes.length,
+                      itemBuilder: (context, index) {
+                        final note = displayNotes[index];
+                        return NoteCard(
+                          note: note,
+                          onTap: () => _showNoteDialog(note: note),
+                          onDelete: () => _deleteNote(note.id),
+                        );
+                      },
+                    )
+                  : Center(
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(
+                            Icons.note_add,
+                            size: 80,
+                            color: Colors.grey.shade300,
+                          ),
+                          SizedBox(height: 20),
+                          Text(
+                            'No notes yet',
+                            style: TextStyle(
+                              fontSize: 20,
+                              color: Colors.grey.shade600,
+                            ),
+                          ),
+                          SizedBox(height: 10),
+                          Text(
+                            'Create your first note by tapping +',
+                            style: TextStyle(color: Colors.grey.shade400),
+                          ),
+                        ],
+                      ),
+                    ),
+            ),
         ],
       ),
       floatingActionButton: FloatingActionButton(
@@ -294,5 +386,55 @@ class _NotesScreenState extends ConsumerState<NotesScreen> {
         child: const Icon(Icons.add),
       ),
     );
+  }
+
+  void _showLogoutDialog() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text('Logout'),
+          content: Text('Are you sure you want to logout?'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(context, true),
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+              child: Text('Logout'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (confirmed == true) {
+      try {
+        // Clear the notes stream before logging out
+        _notesSubscription?.cancel();
+        _notesSubscription = null;
+        setState(() {
+          _allNotes = [];
+          _filteredNotes = [];
+        });
+
+        await ref.read(authViewModelProvider.notifier).signOut();
+
+        // Navigate to auth screen
+        Navigator.of(context).pushAndRemoveUntil(
+          MaterialPageRoute(builder: (context) => const AuthScreen()),
+          (route) => false,
+        );
+      } catch (e) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error: ${e.toString()}'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
   }
 }
